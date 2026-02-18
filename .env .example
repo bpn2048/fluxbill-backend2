@@ -1,0 +1,11 @@
+DATABASE_URL=postgresql+psycopg://postgres:your_password@localhost:5432/fluxbill_demo2
+
+OPENROUTER_API_KEY=replace_me
+OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct
+
+WHISPER_MODEL=small
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
+
+CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5174,http://localhost:5174
+CORS_ORIGIN_REGEX=^https?://(localhost|127\.0\.0\.1)(:\d+)?$
