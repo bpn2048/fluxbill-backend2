@@ -3,19 +3,17 @@ import os
 import re
 import tempfile
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import text
-from sqlmodel import Session
 
 from billing_route import router as billing_router
-from db import engine, init_db
+from db import init_db
 
 load_dotenv()
 
@@ -48,7 +46,18 @@ app.add_middleware(
   allow_headers=["*"],
 )
 app.include_router(billing_router)
-init_db()
+
+
+@app.get("/", include_in_schema=False)
+async def root_ping():
+  # Browsers frequently probe "/" when opening the backend origin.
+  return {"ok": True, "service": "FluxBill Backend"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+  # Avoid repeated 404s for automatic favicon probes.
+  return Response(status_code=204)
 
 ACTIONS = [
   "click",
@@ -80,6 +89,7 @@ TARGETS = [
 class AssistantTextRequest(BaseModel):
   text: str
   active_tab: str = "dashboard"
+  available_targets: List[str] = Field(default_factory=list)
 
 
 class Command(BaseModel):
@@ -87,6 +97,72 @@ class Command(BaseModel):
   target: Optional[str] = None
   args: Dict[str, Any] = Field(default_factory=dict)
   reply: str = "ok"
+
+
+def _is_supported_target(target: str) -> bool:
+  t = (target or "").strip()
+  if not t:
+    return False
+  return t in TARGETS or t.startswith("field.search.")
+
+
+def _normalize_targets(raw_targets: List[str]) -> List[str]:
+  seen = set()
+  out: List[str] = []
+  for raw in raw_targets or []:
+    t = str(raw or "").strip().lower()
+    if not t or t in seen:
+      continue
+    seen.add(t)
+    out.append(t)
+  return out
+
+
+def _apply_search_routing(cmd: Command, active_tab: str, available_targets: List[str]) -> Command:
+  if cmd.action != "type":
+    return cmd
+
+  text_value = str(cmd.args.get("text") or "").strip()
+  if not text_value:
+    return cmd
+
+  tab_key = str(active_tab or "").strip().lower()
+  requested_target = (cmd.target or "field.search").strip().lower()
+  available = _normalize_targets(available_targets)
+  available_set = set(available)
+
+  candidates: List[str] = []
+  page_target = f"field.search.{tab_key}" if tab_key else ""
+
+  if available:
+    if page_target and page_target in available_set:
+      candidates.append(page_target)
+    if requested_target and requested_target in available_set:
+      candidates.append(requested_target)
+    if "field.search" in available_set:
+      candidates.append("field.search")
+  else:
+    if page_target:
+      candidates.append(page_target)
+    if requested_target:
+      candidates.append(requested_target)
+    candidates.append("field.search")
+
+  deduped: List[str] = []
+  seen = set()
+  for t in candidates:
+    if not t or t in seen:
+      continue
+    seen.add(t)
+    deduped.append(t)
+
+  if not deduped:
+    deduped = ["field.search"]
+
+  cmd.target = deduped[0]
+  cmd.args["text"] = text_value
+  cmd.args["search_targets"] = deduped
+  return cmd
 
 
 def _get_whisper_model():
@@ -149,7 +225,7 @@ def _extract_json(text_in: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def plan_command(user_text: str, active_tab: str) -> Command:
+async def plan_command(user_text: str, active_tab: str, available_targets: List[str]) -> Command:
   if not OPENROUTER_API_KEY:
     raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
@@ -162,7 +238,14 @@ async def plan_command(user_text: str, active_tab: str) -> Command:
     "model": OPENROUTER_MODEL,
     "messages": [
       {"role": "system", "content": _system_prompt()},
-      {"role": "user", "content": f"Active tab: {active_tab}\nUser: {user_text}"},
+      {
+        "role": "user",
+        "content": (
+          f"Active tab: {active_tab}\n"
+          f"Available targets: {', '.join(_normalize_targets(available_targets)) or 'none'}\n"
+          f"User: {user_text}"
+        ),
+      },
     ],
     "temperature": 0.1,
   }
@@ -184,14 +267,15 @@ async def plan_command(user_text: str, active_tab: str) -> Command:
 
   if cmd.action not in ACTIONS:
     return Command(action="none", reply="That action is not supported.")
-  if cmd.target is not None and cmd.target not in TARGETS:
+  if cmd.target is not None and not _is_supported_target(cmd.target):
     return Command(action="none", reply="That UI target is not supported.")
 
   if cmd.action == "type":
     text_value = (cmd.args.get("text") or "").strip()
-    if cmd.target != "field.search" or not text_value:
+    if (cmd.target is not None and not str(cmd.target).startswith("field.search")) or not text_value:
       return Command(action="none", reply="Tell me what to search for.")
     cmd.args["text"] = text_value
+    cmd = _apply_search_routing(cmd, active_tab, available_targets)
 
   return cmd
 
@@ -212,29 +296,18 @@ def transcribe_audio(file_path: str) -> str:
   return " ".join([p for p in parts if p]).strip()
 
 
-@app.get("/health", include_in_schema=False)
-def health():
-  return {"ok": True, "whisper_model": WHISPER_MODEL_NAME, "openrouter_model": OPENROUTER_MODEL}
-
-
-@app.get("/health/db", include_in_schema=False)
-def health_db():
-  try:
-    with Session(engine) as session:
-      session.exec(text("SELECT 1"))
-    return {"ok": True}
-  except Exception as exc:
-    raise HTTPException(status_code=500, detail=f"DB connection failed: {exc}") from exc
-
-
 @app.post("/assistant/text", include_in_schema=False)
 async def assistant_text(req: AssistantTextRequest):
-  cmd = await plan_command(req.text, req.active_tab)
+  cmd = await plan_command(req.text, req.active_tab, req.available_targets)
   return {"transcript": req.text, "command": cmd.model_dump()}
 
 
 @app.post("/assistant/voice", include_in_schema=False)
-async def assistant_voice(file: UploadFile = File(...), active_tab: str = Form("dashboard")):
+async def assistant_voice(
+  file: UploadFile = File(...),
+  active_tab: str = Form("dashboard"),
+  available_targets_json: str = Form("[]"),
+):
   filename = file.filename or "voice"
   _, ext = os.path.splitext(filename)
   if not ext:
@@ -249,7 +322,14 @@ async def assistant_voice(file: UploadFile = File(...), active_tab: str = Form("
     if not transcript:
       return {"transcript": "", "command": Command(action="none", reply="I could not hear anything. Try again.").model_dump()}
 
-    cmd = await plan_command(transcript, active_tab)
+    available_targets: List[str]
+    try:
+      parsed = json.loads(available_targets_json or "[]")
+      available_targets = parsed if isinstance(parsed, list) else []
+    except Exception:
+      available_targets = []
+
+    cmd = await plan_command(transcript, active_tab, available_targets)
     return {"transcript": transcript, "command": cmd.model_dump()}
   finally:
     try:

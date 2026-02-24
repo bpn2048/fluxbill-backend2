@@ -1,5 +1,4 @@
 # models.py
-from typing import Optional
 from datetime import date, datetime
 
 from sqlmodel import Field, SQLModel
@@ -31,14 +30,6 @@ class Subscription(SQLModel, table=True):
   customer: str
   mrr: int
   status: str = "active"  # active|past_due|canceled
-
-
-class Payment(SQLModel, table=True):
-  id: Optional[int] = Field(default=None, primary_key=True)
-  invoice_id: str = Field(index=True)
-  amount: int
-  method: str
-  paid_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class AppSetting(SQLModel, table=True):
