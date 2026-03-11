@@ -2,6 +2,11 @@ DATABASE_URL=postgresql+psycopg://postgres:your_password@localhost:5432/fluxbill
 
 OPENROUTER_API_KEY=replace_me
 OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_TIMEOUT_SECONDS=60
+OPENROUTER_SITE_URL=http://127.0.0.1:8000
+OPENROUTER_APP_NAME=FluxBill Backend
+ASSISTANT_HISTORY_MAX_MESSAGES=12
 
 WHISPER_MODEL=small
 WHISPER_DEVICE=cpu

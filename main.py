@@ -3,13 +3,19 @@ import os
 import re
 import tempfile
 from contextlib import asynccontextmanager
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 from billing_route import router as billing_router
@@ -17,9 +23,37 @@ from db import init_db
 
 load_dotenv()
 
+
+def _env_float(name: str, default: float) -> float:
+  raw = os.getenv(name, "").strip()
+  if not raw:
+    return default
+  try:
+    return float(raw)
+  except ValueError:
+    return default
+
+
+def _env_int(name: str, default: int) -> int:
+  raw = os.getenv(name, "").strip()
+  if not raw:
+    return default
+  try:
+    return int(raw)
+  except ValueError:
+    return default
+
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct").strip()
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "http://127.0.0.1:8000").strip()
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "FluxBill Backend").strip()
+OPENROUTER_TIMEOUT_SECONDS = _env_float("OPENROUTER_TIMEOUT_SECONDS", 60.0)
+
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small").strip()
+ASSISTANT_HISTORY_MAX_MESSAGES = max(_env_int("ASSISTANT_HISTORY_MAX_MESSAGES", 12), 2)
+
 CORS_ORIGINS = [
   x.strip()
   for x in os.getenv("CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173").split(",")
@@ -28,6 +62,10 @@ CORS_ORIGINS = [
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$").strip() or None
 
 _whisper_model = None
+_history_lock = Lock()
+_planner_lock = Lock()
+_session_histories: Dict[str, InMemoryChatMessageHistory] = {}
+_planner_chain: Optional[RunnableWithMessageHistory] = None
 
 
 @asynccontextmanager
@@ -58,6 +96,7 @@ async def root_ping():
 async def favicon():
   # Avoid repeated 404s for automatic favicon probes.
   return Response(status_code=204)
+
 
 ACTIONS = [
   "click",
@@ -90,6 +129,7 @@ class AssistantTextRequest(BaseModel):
   text: str
   active_tab: str = "dashboard"
   available_targets: List[str] = Field(default_factory=list)
+  session_id: Optional[str] = None
 
 
 class Command(BaseModel):
@@ -97,6 +137,67 @@ class Command(BaseModel):
   target: Optional[str] = None
   args: Dict[str, Any] = Field(default_factory=dict)
   reply: str = "ok"
+
+
+_command_parser = PydanticOutputParser(pydantic_object=Command)
+
+
+def _normalize_session_id(raw_session_id: Optional[str]) -> str:
+  cleaned = re.sub(r"[^A-Za-z0-9._:-]", "", str(raw_session_id or "").strip())
+  return cleaned[:80] or "default"
+
+
+def _get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+  sid = _normalize_session_id(session_id)
+  with _history_lock:
+    history = _session_histories.get(sid)
+    if history is None:
+      history = InMemoryChatMessageHistory()
+      _session_histories[sid] = history
+    if len(history.messages) > ASSISTANT_HISTORY_MAX_MESSAGES:
+      history.messages = history.messages[-ASSISTANT_HISTORY_MAX_MESSAGES:]
+    return history
+
+
+def _build_planner_chain() -> RunnableWithMessageHistory:
+  headers: Dict[str, str] = {}
+  if OPENROUTER_SITE_URL:
+    headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+  if OPENROUTER_APP_NAME:
+    headers["X-Title"] = OPENROUTER_APP_NAME
+
+  llm = ChatOpenAI(
+    model_name=OPENROUTER_MODEL,
+    openai_api_key=OPENROUTER_API_KEY,
+    openai_api_base=OPENROUTER_BASE_URL,
+    temperature=0.1,
+    request_timeout=OPENROUTER_TIMEOUT_SECONDS,
+    max_retries=1,
+    default_headers=headers,
+  )
+  prompt = ChatPromptTemplate.from_messages(
+    [
+      ("system", "{system_prompt}\n\nFormat instructions:\n{format_instructions}"),
+      MessagesPlaceholder(variable_name="history"),
+      ("human", "{user_message}"),
+    ]
+  )
+  base_chain = prompt | llm | StrOutputParser()
+  return RunnableWithMessageHistory(
+    base_chain,
+    _get_session_history,
+    input_messages_key="user_message",
+    history_messages_key="history",
+  )
+
+
+def _get_planner_chain() -> RunnableWithMessageHistory:
+  global _planner_chain
+  if _planner_chain is None:
+    with _planner_lock:
+      if _planner_chain is None:
+        _planner_chain = _build_planner_chain()
+  return _planner_chain
 
 
 def _is_supported_target(target: str) -> bool:
@@ -116,6 +217,14 @@ def _normalize_targets(raw_targets: List[str]) -> List[str]:
     seen.add(t)
     out.append(t)
   return out
+
+
+def _build_user_message(user_text: str, active_tab: str, available_targets: List[str]) -> str:
+  return (
+    f"Active tab: {active_tab}\n"
+    f"Available targets: {', '.join(_normalize_targets(available_targets)) or 'none'}\n"
+    f"User: {user_text}"
+  )
 
 
 def _apply_search_routing(cmd: Command, active_tab: str, available_targets: List[str]) -> Command:
@@ -192,6 +301,7 @@ Rules:
 - Only use action="click" for explicit navigation intent (open/go to/switch tab).
 - If user says a bare phrase like "delete acme", infer delete_customer with args={{"name":"Acme"}}.
 - Never ask for confirmation (for example "are you sure?") when user asks create/update/delete; treat it as confirmed and return the corresponding action directly.
+- Use prior conversation turns in history for follow-up requests.
 - If user intent is unclear, output action="none" and ask a short question in reply.
 - Always respond in English.
 
@@ -225,45 +335,43 @@ def _extract_json(text_in: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def plan_command(user_text: str, active_tab: str, available_targets: List[str]) -> Command:
+async def plan_command(
+  user_text: str,
+  active_tab: str,
+  available_targets: List[str],
+  session_id: Optional[str] = None,
+) -> Command:
   if not OPENROUTER_API_KEY:
     raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
-  url = "https://openrouter.ai/api/v1/chat/completions"
-  headers = {
-    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-    "Content-Type": "application/json",
-  }
-  payload = {
-    "model": OPENROUTER_MODEL,
-    "messages": [
-      {"role": "system", "content": _system_prompt()},
-      {
-        "role": "user",
-        "content": (
-          f"Active tab: {active_tab}\n"
-          f"Available targets: {', '.join(_normalize_targets(available_targets)) or 'none'}\n"
-          f"User: {user_text}"
-        ),
-      },
-    ],
-    "temperature": 0.1,
-  }
-
-  async with httpx.AsyncClient(timeout=60) as client:
-    r = await client.post(url, headers=headers, json=payload)
-    if r.status_code >= 400:
-      raise HTTPException(status_code=500, detail=f"OpenRouter error: {r.status_code} {r.text}")
-
-  content = r.json()["choices"][0]["message"]["content"]
-  obj = _extract_json(content)
-  if not obj:
-    return Command(action="none", reply='I could not understand. Try: "open invoices", "search apex".')
+  normalized_session_id = _normalize_session_id(session_id)
+  user_message = _build_user_message(user_text, active_tab, available_targets)
 
   try:
-    cmd = Command(**obj)
-  except ValidationError:
-    return Command(action="none", reply="I got an invalid command format. Try again.")
+    content = await _get_planner_chain().ainvoke(
+      {
+        "system_prompt": _system_prompt(),
+        "format_instructions": _command_parser.get_format_instructions(),
+        "user_message": user_message,
+      },
+      config={
+        "configurable": {"session_id": normalized_session_id},
+        "metadata": {"component": "assistant_command_planner", "session_id": normalized_session_id},
+      },
+    )
+  except Exception as exc:
+    raise HTTPException(status_code=500, detail=f"LangChain planner error: {exc}") from exc
+
+  try:
+    cmd = _command_parser.parse(content)
+  except OutputParserException:
+    obj = _extract_json(content)
+    if not obj:
+      return Command(action="none", reply='I could not understand. Try: "open invoices", "search apex".')
+    try:
+      cmd = Command(**obj)
+    except ValidationError:
+      return Command(action="none", reply="I got an invalid command format. Try again.")
 
   if cmd.action not in ACTIONS:
     return Command(action="none", reply="That action is not supported.")
@@ -298,8 +406,9 @@ def transcribe_audio(file_path: str) -> str:
 
 @app.post("/assistant/text", include_in_schema=False)
 async def assistant_text(req: AssistantTextRequest):
-  cmd = await plan_command(req.text, req.active_tab, req.available_targets)
-  return {"transcript": req.text, "command": cmd.model_dump()}
+  session_id = _normalize_session_id(req.session_id)
+  cmd = await plan_command(req.text, req.active_tab, req.available_targets, session_id=session_id)
+  return {"session_id": session_id, "transcript": req.text, "command": cmd.model_dump()}
 
 
 @app.post("/assistant/voice", include_in_schema=False)
@@ -307,7 +416,9 @@ async def assistant_voice(
   file: UploadFile = File(...),
   active_tab: str = Form("dashboard"),
   available_targets_json: str = Form("[]"),
+  session_id: str = Form("default"),
 ):
+  normalized_session_id = _normalize_session_id(session_id)
   filename = file.filename or "voice"
   _, ext = os.path.splitext(filename)
   if not ext:
@@ -320,7 +431,11 @@ async def assistant_voice(
   try:
     transcript = transcribe_audio(tmp_path)
     if not transcript:
-      return {"transcript": "", "command": Command(action="none", reply="I could not hear anything. Try again.").model_dump()}
+      return {
+        "session_id": normalized_session_id,
+        "transcript": "",
+        "command": Command(action="none", reply="I could not hear anything. Try again.").model_dump(),
+      }
 
     available_targets: List[str]
     try:
@@ -329,8 +444,8 @@ async def assistant_voice(
     except Exception:
       available_targets = []
 
-    cmd = await plan_command(transcript, active_tab, available_targets)
-    return {"transcript": transcript, "command": cmd.model_dump()}
+    cmd = await plan_command(transcript, active_tab, available_targets, session_id=normalized_session_id)
+    return {"session_id": normalized_session_id, "transcript": transcript, "command": cmd.model_dump()}
   finally:
     try:
       os.remove(tmp_path)

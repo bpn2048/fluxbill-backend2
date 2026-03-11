@@ -8,6 +8,8 @@ pydantic==2.10.3
 faster-whisper==1.0.3
 requests==2.32.3
 huggingface_hub==0.26.2
+langchain==1.2.10
+langchain-openai==1.1.10
 
 sqlmodel==0.0.22
 sqlalchemy==2.0.36

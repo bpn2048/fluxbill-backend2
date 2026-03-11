@@ -1,9 +1,10 @@
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Type
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from db import get_session
@@ -11,6 +12,7 @@ from models import AppSetting, Customer, Invoice, Subscription
 
 
 router = APIRouter(prefix="/api", tags=["billing"])
+ID_GENERATION_MAX_RETRIES = 6
 
 
 class InvoiceCreate(BaseModel):
@@ -242,6 +244,53 @@ def _next_code(existing_ids: List[str], prefix: str, width: int = 4) -> str:
   return f"{prefix}-{str(max_num + 1).zfill(width)}"
 
 
+def _next_model_code(session: Session, model: Type[Any], prefix: str, width: int) -> str:
+  existing_ids = session.exec(select(model.id)).all()
+  return _next_code(existing_ids, prefix=prefix, width=width)
+
+
+def _normalize_lookup_text(value: Any) -> str:
+  return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _resolve_customer(
+  session: Session,
+  customer_code: Optional[str] = None,
+  customer_name: Optional[str] = None,
+) -> Optional[Customer]:
+  code = _normalize_lookup_text(customer_code)
+  name = _normalize_lookup_text(customer_name)
+
+  if code:
+    customer = session.get(Customer, code)
+    if customer:
+      return customer
+    if not name:
+      # Keep compatibility when UI sends a customer name in customer_code.
+      name = code
+
+  if name:
+    wanted = name.lower()
+    for row in session.exec(select(Customer)).all():
+      if _normalize_lookup_text(row.name).lower() == wanted:
+        return row
+
+  return None
+
+
+def _adjust_customer_invoice_count(session: Session, customer_id: str, delta: int) -> Optional[Customer]:
+  customer = session.exec(
+    select(Customer).where(Customer.id == customer_id).with_for_update()
+  ).first()
+  if not customer:
+    return None
+
+  current = int(customer.invoices or 0)
+  customer.invoices = max(current + int(delta), 0)
+  session.add(customer)
+  return customer
+
+
 def _get_settings(session: Session) -> AppSetting:
   settings = session.get(AppSetting, 1)
   if settings:
@@ -403,68 +452,47 @@ def create_invoice(payload: InvoiceCreate, session: Session = Depends(get_sessio
 
   customer_code = str(payload.customer_code or payload.customer_id or "").strip()
   customer_name = str(payload.customer_name or payload.customer or "").strip()
-  # If UI sends company name inside customer_code/customer_id, treat it as a name fallback.
-  if not customer_name and customer_code:
-    customer_name = customer_code
-  customer: Optional[Customer] = None
-  customer_ref = ""
-  known_customers: Optional[List[Customer]] = None
+  customer = _resolve_customer(session, customer_code=customer_code, customer_name=customer_name)
+  if not customer:
+    raise HTTPException(status_code=400, detail="Customer not found for invoice")
 
-  # Prefer explicit customer id/code and store the canonical customer id.
-  if customer_code:
-    customer = session.get(Customer, customer_code)
-    if customer:
-      customer_ref = customer.id
-
-  # Fall back to matching by customer name when id/code is missing.
-  if not customer_ref and customer_name:
-    known_customers = session.exec(select(Customer)).all()
-    wanted = re.sub(r"\s+", " ", customer_name).strip().lower()
-    customer = next(
-      (
-        c
-        for c in known_customers
-        if re.sub(r"\s+", " ", str(c.name or "")).strip().lower() == wanted
-      ),
-      None,
-    )
-    if customer:
-      customer_ref = customer.id
-
-  # Final fallback keeps old behavior: use the first available customer.
-  if not customer_ref:
-    fallback_customer = known_customers[0] if known_customers else session.exec(select(Customer)).first()
-    if fallback_customer:
-      customer = fallback_customer
-      customer_ref = fallback_customer.id
-
-  if not customer_ref:
-    raise HTTPException(status_code=400, detail="No customer available for invoice")
-
-  existing_ids = session.exec(select(Invoice.id)).all()
-  invoice_id = _next_code(existing_ids, invoice_prefix, width=4)
+  customer_ref = customer.id
   created = date.today()
   due = payload.due or (created + timedelta(days=14))
+  amount = int(payload.amount)
+  currency = (payload.currency or "INR").upper()
+  status = (payload.status or "draft").lower()
+  method = payload.method or "-"
 
-  inv = Invoice(
-    id=invoice_id,
-    customer=customer_ref,
-    amount=int(payload.amount),
-    currency=(payload.currency or "INR").upper(),
-    status=(payload.status or "draft").lower(),
-    due=due,
-    created=created,
-    method=(payload.method or "-"),
-  )
-  session.add(inv)
+  for attempt in range(ID_GENERATION_MAX_RETRIES):
+    invoice_id = _next_model_code(session, Invoice, invoice_prefix, width=4)
+    inv = Invoice(
+      id=invoice_id,
+      customer=customer_ref,
+      amount=amount,
+      currency=currency,
+      status=status,
+      due=due,
+      created=created,
+      method=method,
+    )
+    session.add(inv)
 
-  if customer:
-    customer.invoices = int(customer.invoices or 0) + 1
-    session.add(customer)
+    tracked_customer = _adjust_customer_invoice_count(session, customer_ref, +1)
+    if not tracked_customer:
+      session.rollback()
+      raise HTTPException(status_code=400, detail="Customer not found for invoice")
 
-  session.commit()
-  session.refresh(inv)
-  return inv
+    try:
+      session.commit()
+      session.refresh(inv)
+      return inv
+    except IntegrityError:
+      session.rollback()
+      if attempt == ID_GENERATION_MAX_RETRIES - 1:
+        raise HTTPException(status_code=409, detail="Could not allocate invoice id. Retry request.")
+
+  raise HTTPException(status_code=409, detail="Could not allocate invoice id. Retry request.")
 
 
 @router.patch("/invoices/{invoice_id}", response_model=Invoice, summary="Update Invoice")
@@ -474,8 +502,31 @@ def patch_invoice(invoice_id: str, payload: InvoiceUpdate, session: Session = De
     raise HTTPException(status_code=404, detail="Invoice not found")
 
   updates = payload.model_dump(exclude_unset=True)
+  old_customer_ref = inv.customer
+
+  if "customer" in updates:
+    requested_customer = _normalize_lookup_text(updates.get("customer"))
+    if not requested_customer:
+      raise HTTPException(status_code=400, detail="Customer is required for invoice update")
+    customer = _resolve_customer(session, customer_code=requested_customer, customer_name=requested_customer)
+    if not customer:
+      raise HTTPException(status_code=400, detail="Customer not found for invoice update")
+    updates["customer"] = customer.id
+
   for key, value in updates.items():
     setattr(inv, key, value)
+
+  new_customer_ref = inv.customer
+  if new_customer_ref != old_customer_ref:
+    old_customer = _adjust_customer_invoice_count(session, old_customer_ref, -1)
+    if old_customer:
+      session.add(old_customer)
+
+    new_customer = _adjust_customer_invoice_count(session, new_customer_ref, +1)
+    if not new_customer:
+      session.rollback()
+      raise HTTPException(status_code=400, detail="Customer not found for invoice update")
+    session.add(new_customer)
 
   session.add(inv)
   session.commit()
@@ -488,6 +539,11 @@ def delete_invoice(invoice_id: str, session: Session = Depends(get_session)):
   inv = session.get(Invoice, invoice_id)
   if not inv:
     raise HTTPException(status_code=404, detail="Invoice not found")
+
+  customer = _adjust_customer_invoice_count(session, inv.customer, -1)
+  if customer:
+    session.add(customer)
+
   session.delete(inv)
   session.commit()
   return {"ok": True, "invoice_id": invoice_id}
@@ -495,26 +551,48 @@ def delete_invoice(invoice_id: str, session: Session = Depends(get_session)):
 
 @router.post("/customers", response_model=Customer, summary="Create Customer")
 def create_customer(payload: CustomerCreate, session: Session = Depends(get_session)):
-  if payload.id:
-    existing = session.get(Customer, payload.id)
-    if existing:
-      raise HTTPException(status_code=409, detail="Customer id already exists")
-    customer_id = payload.id
-  else:
-    ids = session.exec(select(Customer.id)).all()
-    customer_id = _next_code(ids, "CUST", width=3)
+  name = payload.name.strip()
+  if not name:
+    raise HTTPException(status_code=400, detail="Customer name is required")
 
-  customer = Customer(
-    id=customer_id,
-    name=payload.name.strip(),
-    tier=payload.tier,
-    invoices=int(payload.invoices or 0),
-    status=payload.status,
-  )
-  session.add(customer)
-  session.commit()
-  session.refresh(customer)
-  return customer
+  provided_customer_id = str(payload.id or "").strip()
+  if provided_customer_id:
+    customer = Customer(
+      id=provided_customer_id,
+      name=name,
+      tier=payload.tier,
+      invoices=int(payload.invoices or 0),
+      status=payload.status,
+    )
+    session.add(customer)
+    try:
+      session.commit()
+      session.refresh(customer)
+      return customer
+    except IntegrityError:
+      session.rollback()
+      raise HTTPException(status_code=409, detail="Customer id already exists")
+
+  for attempt in range(ID_GENERATION_MAX_RETRIES):
+    customer_id = _next_model_code(session, Customer, "CUST", width=3)
+    customer = Customer(
+      id=customer_id,
+      name=name,
+      tier=payload.tier,
+      invoices=int(payload.invoices or 0),
+      status=payload.status,
+    )
+    session.add(customer)
+    try:
+      session.commit()
+      session.refresh(customer)
+      return customer
+    except IntegrityError:
+      session.rollback()
+      if attempt == ID_GENERATION_MAX_RETRIES - 1:
+        raise HTTPException(status_code=409, detail="Could not allocate customer id. Retry request.")
+
+  raise HTTPException(status_code=409, detail="Could not allocate customer id. Retry request.")
 
 
 @router.put("/customers/{customer_id}", response_model=Customer, summary="Update Customer")
@@ -565,64 +643,53 @@ def list_subscriptions(q: Optional[str] = None, session: Session = Depends(get_s
 def create_subscription(payload: SubscriptionCreate, session: Session = Depends(get_session)):
   customer_code = str(payload.customer_code or payload.customer_id or "").strip()
   customer_name = str(payload.customer_name or payload.customer or "").strip()
-  # If UI sends company name inside customer_code/customer_id, treat it as a name fallback.
-  if not customer_name and customer_code:
-    customer_name = customer_code
-  customer: Optional[Customer] = None
-  customer_ref = ""
-  known_customers: Optional[List[Customer]] = None
+  customer = _resolve_customer(session, customer_code=customer_code, customer_name=customer_name)
+  if not customer:
+    raise HTTPException(status_code=400, detail="Customer not found for subscription")
 
-  # Prefer explicit customer id/code and store the canonical customer id.
-  if customer_code:
-    customer = session.get(Customer, customer_code)
-    if customer:
-      customer_ref = customer.id
+  customer_ref = customer.id
+  plan = payload.plan
+  mrr = int(payload.mrr or 0)
+  status = payload.status
 
-  # Fall back to matching by customer name when id/code is missing.
-  if not customer_ref and customer_name:
-    known_customers = session.exec(select(Customer)).all()
-    wanted = re.sub(r"\s+", " ", customer_name).strip().lower()
-    customer = next(
-      (
-        c
-        for c in known_customers
-        if re.sub(r"\s+", " ", str(c.name or "")).strip().lower() == wanted
-      ),
-      None,
+  provided_subscription_id = str(payload.id or "").strip()
+  if provided_subscription_id:
+    sub = Subscription(
+      id=provided_subscription_id,
+      plan=plan,
+      customer=customer_ref,
+      mrr=mrr,
+      status=status,
     )
-    if customer:
-      customer_ref = customer.id
-
-  # Final fallback keeps old behavior: use the first available customer.
-  if not customer_ref:
-    fallback_customer = known_customers[0] if known_customers else session.exec(select(Customer)).first()
-    if fallback_customer:
-      customer = fallback_customer
-      customer_ref = fallback_customer.id
-
-  if not customer_ref:
-    raise HTTPException(status_code=400, detail="No customer available for subscription")
-
-  if payload.id:
-    existing = session.get(Subscription, payload.id)
-    if existing:
+    session.add(sub)
+    try:
+      session.commit()
+      session.refresh(sub)
+      return sub
+    except IntegrityError:
+      session.rollback()
       raise HTTPException(status_code=409, detail="Subscription id already exists")
-    sub_id = payload.id
-  else:
-    ids = session.exec(select(Subscription.id)).all()
-    sub_id = _next_code(ids, "SUB", width=4)
 
-  sub = Subscription(
-    id=sub_id,
-    plan=payload.plan,
-    customer=customer_ref,
-    mrr=int(payload.mrr or 0),
-    status=payload.status,
-  )
-  session.add(sub)
-  session.commit()
-  session.refresh(sub)
-  return sub
+  for attempt in range(ID_GENERATION_MAX_RETRIES):
+    sub_id = _next_model_code(session, Subscription, "SUB", width=4)
+    sub = Subscription(
+      id=sub_id,
+      plan=plan,
+      customer=customer_ref,
+      mrr=mrr,
+      status=status,
+    )
+    session.add(sub)
+    try:
+      session.commit()
+      session.refresh(sub)
+      return sub
+    except IntegrityError:
+      session.rollback()
+      if attempt == ID_GENERATION_MAX_RETRIES - 1:
+        raise HTTPException(status_code=409, detail="Could not allocate subscription id. Retry request.")
+
+  raise HTTPException(status_code=409, detail="Could not allocate subscription id. Retry request.")
 
 
 @router.put("/subscriptions/{sub_id}", response_model=Subscription, summary="Update Subscription")
@@ -649,35 +716,11 @@ def put_subscription(sub_id: str, payload: SubscriptionUpdate, session: Session 
       or raw_customer
       or ""
     ).strip()
-    if not customer_name and customer_code:
-      customer_name = customer_code
-
-    customer_ref = ""
-    known_customers: Optional[List[Customer]] = None
-
-    if customer_code:
-      customer = session.get(Customer, customer_code)
-      if customer:
-        customer_ref = customer.id
-
-    if not customer_ref and customer_name:
-      known_customers = session.exec(select(Customer)).all()
-      wanted = re.sub(r"\s+", " ", customer_name).strip().lower()
-      customer = next(
-        (
-          c
-          for c in known_customers
-          if re.sub(r"\s+", " ", str(c.name or "")).strip().lower() == wanted
-        ),
-        None,
-      )
-      if customer:
-        customer_ref = customer.id
-
-    if not customer_ref:
+    customer = _resolve_customer(session, customer_code=customer_code, customer_name=customer_name)
+    if not customer:
       raise HTTPException(status_code=400, detail="Customer not found for subscription update")
 
-    updates["customer"] = customer_ref
+    updates["customer"] = customer.id
 
   # These fields are internal input helpers; do not store directly.
   updates.pop("customer_name", None)

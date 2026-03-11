@@ -15,7 +15,7 @@ class Customer(SQLModel, table=True):
 
 class Invoice(SQLModel, table=True):
   id: str = Field(primary_key=True, index=True)  # INV-10428
-  customer: str
+  customer: str = Field(foreign_key="customer.id", index=True)
   amount: int
   currency: str = "INR"
   status: str = "sent"  # draft|sent|overdue|paid
@@ -27,7 +27,7 @@ class Invoice(SQLModel, table=True):
 class Subscription(SQLModel, table=True):
   id: str = Field(primary_key=True, index=True)  # SUB-2201
   plan: str
-  customer: str
+  customer: str = Field(foreign_key="customer.id", index=True)
   mrr: int
   status: str = "active"  # active|past_due|canceled
 
