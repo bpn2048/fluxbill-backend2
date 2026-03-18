@@ -310,8 +310,8 @@ def _serialize_settings(settings: AppSetting) -> dict:
   }
 
 
-@router.get("/intial-state", summary="Initial State")
-def intial_state(session: Session = Depends(get_session)):
+@router.get("/initial-state", summary="Initial State")
+def initial_state(session: Session = Depends(get_session)):
   return {
     "settings": _serialize_settings(_get_settings(session)),
     "customers": session.exec(select(Customer)).all(),
