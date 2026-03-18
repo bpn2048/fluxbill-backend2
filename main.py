@@ -124,6 +124,99 @@ TARGETS = [
   "action.collectPayment",
 ]
 
+NAVIGATION_TARGET_ALIASES = {
+  "nav.dashboard": {"dashboard", "dash", "home", "overview"},
+  "nav.invoices": {"invoice", "invoices", "in voice", "in voices"},
+  "nav.subscriptions": {"subscription", "subscriptions", "plan", "plans"},
+  "nav.customers": {"customer", "customers", "client", "clients"},
+  "nav.reports": {"report", "reports", "analytics"},
+  "nav.settings": {"setting", "settings", "preferences"},
+}
+
+NAVIGATION_VERBS = (
+  "switch tab to",
+  "navigate to",
+  "take me to",
+  "switch to",
+  "go to",
+  "goto",
+  "open",
+  "show",
+)
+
+INCOMPLETE_COMMAND_FILLER_WORDS = {
+  "a",
+  "an",
+  "the",
+  "my",
+  "me",
+  "please",
+  "now",
+  "tab",
+  "page",
+  "screen",
+  "section",
+  "item",
+  "thing",
+  "one",
+  "something",
+  "anything",
+  "new",
+  "it",
+  "this",
+  "that",
+}
+
+INCOMPLETE_COMMAND_PROMPTS = (
+  (
+    NAVIGATION_VERBS,
+    "What should I open: dashboard, invoices, customers, subscriptions, reports, or settings?",
+  ),
+  (
+    ("create", "add", "new"),
+    "What should I create: invoice, customer, or subscription?",
+  ),
+  (
+    ("delete", "remove"),
+    "What should I delete: invoice, customer, or subscription?",
+  ),
+  (
+    ("update", "edit", "change"),
+    "What should I update: invoice, customer, or subscription?",
+  ),
+  (
+    ("search", "find"),
+    "What should I search for?",
+  ),
+  (
+    ("filter",),
+    "What should I filter: invoices by amount or status?",
+  ),
+)
+
+VOICE_HOTWORDS = (
+  "invoice, invoices, customer, customers, subscription, subscriptions, "
+  "dashboard, reports, settings, billing"
+)
+
+VOICE_TRANSCRIPT_REPLACEMENTS = (
+  (r"\bin voices\b", "invoices"),
+  (r"\bin voice\b", "invoice"),
+  (r"\bopen invoices\b", "open invoices"),
+  (r"\bopen invoice\b", "open invoice"),
+  (r"\bgo to in voices\b", "go to invoices"),
+  (r"\bgo to in voice\b", "go to invoice"),
+  (r"\bswitch to in voices\b", "switch to invoices"),
+  (r"\bswitch to in voice\b", "switch to invoice"),
+  (r"\bshow in voices\b", "show invoices"),
+  (r"\bshow in voice\b", "show invoice"),
+  (r"\bdelete in voices\b", "delete invoices"),
+  (r"\bdelete in voice\b", "delete invoice"),
+  (r"\bupdate in voices\b", "update invoices"),
+  (r"\bupdate in voice\b", "update invoice"),
+  (r"\bcreate in voice\b", "create invoice"),
+)
+
 
 class AssistantTextRequest(BaseModel):
   text: str
@@ -225,6 +318,76 @@ def _build_user_message(user_text: str, active_tab: str, available_targets: List
     f"Available targets: {', '.join(_normalize_targets(available_targets)) or 'none'}\n"
     f"User: {user_text}"
   )
+
+
+def _normalize_phrase(text: str) -> str:
+  collapsed = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+  return re.sub(r"\s+", " ", collapsed).strip()
+
+
+def _match_navigation_target(user_text: str) -> Optional[str]:
+  normalized = _normalize_phrase(user_text)
+  if not normalized:
+    return None
+
+  matched_verb = next(
+    (verb for verb in NAVIGATION_VERBS if normalized == verb or normalized.startswith(f"{verb} ")),
+    None,
+  )
+  if not matched_verb:
+    return None
+
+  remainder = normalized[len(matched_verb):].strip()
+  remainder = re.sub(r"^(the|my)\s+", "", remainder)
+  remainder = re.sub(r"\s+(tab|page|screen|section)$", "", remainder).strip()
+  if not remainder:
+    return None
+
+  for target, aliases in NAVIGATION_TARGET_ALIASES.items():
+    if remainder in aliases:
+      return target
+  return None
+
+
+def _build_navigation_command(target: str) -> Command:
+  label = target.split(".", 1)[1]
+  return Command(action="click", target=target, reply=f"opening {label}.")
+
+
+def _match_incomplete_command_reply(user_text: str) -> Optional[str]:
+  normalized = _normalize_phrase(user_text)
+  if not normalized:
+    return None
+
+  for verbs, reply in INCOMPLETE_COMMAND_PROMPTS:
+    matched_verb = next(
+      (verb for verb in verbs if normalized == verb or normalized.startswith(f"{verb} ")),
+      None,
+    )
+    if not matched_verb:
+      continue
+
+    remainder = normalized[len(matched_verb):].strip()
+    if not remainder:
+      return reply
+
+    tokens = [token for token in remainder.split(" ") if token]
+    if tokens and all(token in INCOMPLETE_COMMAND_FILLER_WORDS for token in tokens):
+      return reply
+
+  return None
+
+
+def _normalize_voice_transcript(text: str) -> str:
+  normalized = str(text or "").strip()
+  if not normalized:
+    return ""
+
+  for pattern, replacement in VOICE_TRANSCRIPT_REPLACEMENTS:
+    normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+
+  normalized = re.sub(r"\s+", " ", normalized).strip()
+  return normalized
 
 
 def _apply_search_routing(cmd: Command, active_tab: str, available_targets: List[str]) -> Command:
@@ -341,6 +504,14 @@ async def plan_command(
   available_targets: List[str],
   session_id: Optional[str] = None,
 ) -> Command:
+  incomplete_reply = _match_incomplete_command_reply(user_text)
+  if incomplete_reply:
+    return Command(action="none", reply=incomplete_reply)
+
+  nav_target = _match_navigation_target(user_text)
+  if nav_target:
+    return _build_navigation_command(nav_target)
+
   if not OPENROUTER_API_KEY:
     raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
@@ -395,13 +566,17 @@ def transcribe_audio(file_path: str) -> str:
     language="en",
     task="transcribe",
     vad_filter=True,
-    initial_prompt="This is English. Transcribe only English words.",
+    initial_prompt=(
+      "This is English for a billing dashboard. Important words include invoice, invoices, "
+      "customer, customers, subscription, subscriptions, dashboard, reports, and settings."
+    ),
+    hotwords=VOICE_HOTWORDS,
   )
   parts = []
   for s in segments:
     if s.text:
       parts.append(s.text.strip())
-  return " ".join([p for p in parts if p]).strip()
+  return _normalize_voice_transcript(" ".join([p for p in parts if p]).strip())
 
 
 @app.post("/assistant/text", include_in_schema=False)
