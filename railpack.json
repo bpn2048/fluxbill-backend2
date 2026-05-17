@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.railpack.com",
+  "buildAptPackages": [
+    "libavformat-dev",
+    "libavcodec-dev",
+    "libavdevice-dev",
+    "libavutil-dev",
+    "libavfilter-dev",
+    "libswscale-dev",
+    "libswresample-dev"
+  ]
+}
