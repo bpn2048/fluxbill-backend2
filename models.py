@@ -8,19 +8,17 @@ class AppSetting(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     company_name: str
     invoice_prefix: str
-    # Made optional to safely handle missing or empty initialization timestamps
-    updated_at: Optional[datetime] = Field(default=None)
+    # Explicitly mark nullable on both the database and pydantic layers
+    updated_at: Optional[datetime] = Field(default=None, sa_column_kwargs={"nullable": True})
 
 
 class Customer(SQLModel, table=True):
-    # Some pre-existing setups might pass explicit code keys (e.g., 'CUST-001')
     id: str = Field(primary_key=True)
     name: str
     tier: str = "SMB"  # SMB | Mid-market | Enterprise
     invoices: int = 0
     status: str = "new"  # active | new | at_risk
-    # Made optional to handle records imported without explicit creation history
-    created_at: Optional[datetime] = Field(default=None)
+    created_at: Optional[datetime] = Field(default=None, sa_column_kwargs={"nullable": True})
 
 
 class Invoice(SQLModel, table=True):
@@ -28,11 +26,10 @@ class Invoice(SQLModel, table=True):
     customer: str  # References Customer.id
     amount: int
     currency: str = "INR"
-    status: str = "draft"  # draft | sent | paid | over-due
+    status: str = "draft"  # draft | sent | paid | overdue
     created: date
-    # Made optional to handle old historical or un-sent invoice rows cleanly
-    due: Optional[date] = Field(default=None)
-    method: Optional[str] = Field(default="-")  # UPI | Card | NetBanking | -
+    due: Optional[date] = Field(default=None, sa_column_kwargs={"nullable": True})
+    method: Optional[str] = Field(default="-", sa_column_kwargs={"nullable": True})
 
 
 class Subscription(SQLModel, table=True):
@@ -41,5 +38,5 @@ class Subscription(SQLModel, table=True):
     customer: str  # References Customer.id
     mrr: int = 0
     status: str = "active"  # active | past_due | canceled
-    # Made optional to gracefully handle subscriptions generated without explicit date bounds
-    created_at: Optional[datetime] = Field(default=None)
+    # Force direct null safety evaluation for your imported database rows
+    created_at: Optional[datetime] = Field(default=None, sa_column_kwargs={"nullable": True})
