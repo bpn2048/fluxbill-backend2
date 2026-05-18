@@ -1,6 +1,6 @@
 # models.py
 from datetime import date, datetime
-
+from typing import Optional
 from sqlmodel import Field, SQLModel
 
 
@@ -33,7 +33,9 @@ class Subscription(SQLModel, table=True):
 
 
 class AppSetting(SQLModel, table=True):
-  id: int = Field(default=1, primary_key=True)
-  company_name: str = "FluxBill"
-  invoice_prefix: str = "INV"
-  updated_at: datetime = Field(default_factory=datetime.utcnow)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company_name: str
+    invoice_prefix: str
+    
+    # Change this field to be Optional so it can safely handle NULL values from the DB!
+    updated_at: Optional[datetime] = Field(default=None)
