@@ -13,5 +13,5 @@ langchain-openai==1.1.10
 
 sqlmodel==0.0.22
 sqlalchemy==2.0.36
-psycopg2[binary]==3.2.3
+psycopg[binary]==3.2.3
 reportLab
