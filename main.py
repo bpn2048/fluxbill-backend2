@@ -268,7 +268,7 @@ def _build_planner_chain() -> RunnableWithMessageHistory:
   llm = ChatOpenAI(
     model_name=OPENROUTER_MODEL,
     api_key=OPENROUTER_API_KEY,
-    openai_api_base=OPENROUTER_BASE_URL,
+    api_base=OPENROUTER_BASE_URL,
     temperature=0.1,
     request_timeout=OPENROUTER_TIMEOUT_SECONDS,
     max_retries=1,
