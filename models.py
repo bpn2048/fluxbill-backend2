@@ -1,41 +1,45 @@
-# models.py
+import os
 from datetime import date, datetime
 from typing import Optional
 from sqlmodel import Field, SQLModel
-
-
-class Customer(SQLModel, table=True):
-  id: str = Field(primary_key=True, index=True)
-  name: str
-  tier: str = "SMB"
-  invoices: int = 0
-  status: str = "new"
-  created_at: datetime = Field(default_factory=datetime.utcnow)
-
-
-class Invoice(SQLModel, table=True):
-  id: str = Field(primary_key=True, index=True)  # INV-10428
-  customer: str = Field(foreign_key="customer.id", index=True)
-  amount: int
-  currency: str = "INR"
-  status: str = "sent"  # draft|sent|overdue|paid
-  due: date
-  created: date
-  method: str = "-"
-
-
-class Subscription(SQLModel, table=True):
-  id: str = Field(primary_key=True, index=True)  # SUB-2201
-  plan: str
-  customer: str = Field(foreign_key="customer.id", index=True)
-  mrr: int
-  status: str = "active"  # active|past_due|canceled
 
 
 class AppSetting(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     company_name: str
     invoice_prefix: str
-    
-    # Change this field to be Optional so it can safely handle NULL values from the DB!
+    # Made optional to safely handle missing or empty initialization timestamps
     updated_at: Optional[datetime] = Field(default=None)
+
+
+class Customer(SQLModel, table=True):
+    # Some pre-existing setups might pass explicit code keys (e.g., 'CUST-001')
+    id: str = Field(primary_key=True)
+    name: str
+    tier: str = "SMB"  # SMB | Mid-market | Enterprise
+    invoices: int = 0
+    status: str = "new"  # active | new | at_risk
+    # Made optional to handle records imported without explicit creation history
+    created_at: Optional[datetime] = Field(default=None)
+
+
+class Invoice(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    customer: str  # References Customer.id
+    amount: int
+    currency: str = "INR"
+    status: str = "draft"  # draft | sent | paid | over-due
+    created: date
+    # Made optional to handle old historical or un-sent invoice rows cleanly
+    due: Optional[date] = Field(default=None)
+    method: Optional[str] = Field(default="-")  # UPI | Card | NetBanking | -
+
+
+class Subscription(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    plan: str = "Starter"  # Starter | Growth | Enterprise
+    customer: str  # References Customer.id
+    mrr: int = 0
+    status: str = "active"  # active | past_due | canceled
+    # Made optional to gracefully handle subscriptions generated without explicit date bounds
+    created_at: Optional[datetime] = Field(default=None)
